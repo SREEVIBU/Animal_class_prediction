@@ -1,44 +1,42 @@
 import os
-import argparse
-import json
-from typing import Dict, List
+from typing import Dict, Tuple
 
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score
 import joblib
-from flask import Flask, request, jsonify
 
-# Paths
+# Try to import scikit-learn; show a helpful message in the UI if missing
+SKLEARN_AVAILABLE = True
+SKLEARN_IMPORT_ERROR = None
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import accuracy_score
+except Exception as e:
+    SKLEARN_AVAILABLE = False
+    SKLEARN_IMPORT_ERROR = str(e)
+
+SKLEARN_INSTALL_CMD = "pip install scikit-learn"
+
 BASE_DIR = os.path.dirname(__file__)
 ZOO_CSV = os.path.join(BASE_DIR, "zoo.csv")
 CLASS_CSV = os.path.join(BASE_DIR, "class.csv")
 MODEL_PATH = os.path.join(BASE_DIR, "zoo_rf_model.joblib")
 
 
-def load_data(zoo_path: str = ZOO_CSV) -> pd.DataFrame:
-    """Load zoo dataset."""
-    df = pd.read_csv(zoo_path)
-    return df
+def load_data() -> pd.DataFrame:
+    return pd.read_csv(ZOO_CSV)
 
 
-def build_label_mapping(class_csv: str = CLASS_CSV) -> Dict[int, str]:
-    """Return mapping from class_type integer to human readable class name.
-
-    The `class.csv` file uses `Class_Number` as id and `Class_Type` as name.
-    The `zoo.csv` file uses `class_type` column with integer values.
-    """
-    if not os.path.exists(class_csv):
+def build_label_mapping() -> Dict[int, str]:
+    if not os.path.exists(CLASS_CSV):
         return {}
-    df = pd.read_csv(class_csv)
+    df = pd.read_csv(CLASS_CSV)
     mapping = {}
-    # Try to read rows, fallback to possible different column names
     if 'Class_Number' in df.columns and 'Class_Type' in df.columns:
         for _, r in df.iterrows():
             mapping[int(r['Class_Number'])] = str(r['Class_Type'])
     else:
-        # last resort: map class_type value to Class_Type if present
+        # fallback: try to infer
         for _, r in df.iterrows():
             keys = [c for c in df.columns if 'class' in c.lower() or 'number' in c.lower()]
             vals = [c for c in df.columns if 'type' in c.lower() or 'class' in c.lower()]
@@ -50,109 +48,132 @@ def build_label_mapping(class_csv: str = CLASS_CSV) -> Dict[int, str]:
     return mapping
 
 
-def train_and_save(zoo_csv: str = ZOO_CSV, model_path: str = MODEL_PATH) -> Dict:
-    df = load_data(zoo_csv)
-    # The dataset contains 'animal_name' and many binary features plus 'class_type'
-    if 'class_type' not in df.columns:
-        raise ValueError("zoo.csv must contain a 'class_type' column")
-
+def train_model(df: pd.DataFrame) -> Tuple[object, float]:
+    if not SKLEARN_AVAILABLE:
+        raise RuntimeError(f"scikit-learn missing: {SKLEARN_IMPORT_ERROR}")
     X = df.drop(columns=['animal_name', 'class_type'])
     y = df['class_type']
-
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-
     clf = RandomForestClassifier(n_estimators=100, random_state=42)
     clf.fit(X_train, y_train)
-
     preds = clf.predict(X_test)
-    acc = accuracy_score(y_test, preds)
-    report = classification_report(y_test, preds, output_dict=True)
-
-    joblib.dump(clf, model_path)
-
-    return {"accuracy": acc, "report": report, "model_path": model_path}
+    acc = float(accuracy_score(y_test, preds))
+    joblib.dump(clf, MODEL_PATH)
+    return clf, acc
 
 
-def load_model(model_path: str = MODEL_PATH):
-    if not os.path.exists(model_path):
+def load_model():
+    if not os.path.exists(MODEL_PATH):
         return None
-    return joblib.load(model_path)
+    try:
+        return joblib.load(MODEL_PATH)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load model: {e}")
 
 
-def predict_from_features(features: Dict[str, int], model) -> int:
+def predict_from_features(model, features: Dict[str, int]) -> int:
+    if not SKLEARN_AVAILABLE:
+        raise RuntimeError(f"scikit-learn missing: {SKLEARN_IMPORT_ERROR}")
     df = pd.DataFrame([features])
-    pred = model.predict(df)
-    return int(pred[0])
+    pred = model.predict(df)[0]
+    return int(pred)
 
 
-def find_features_for_animal(animal_name: str, zoo_csv: str = ZOO_CSV) -> Dict[str, int]:
-    df = load_data(zoo_csv)
-    # match by animal_name case-insensitive
-    match = df[df['animal_name'].str.lower() == animal_name.lower()]
+def get_features_for_animal(df: pd.DataFrame, name: str) -> Dict[str, int]:
+    match = df[df['animal_name'].str.lower() == name.lower()]
     if match.empty:
         return {}
     row = match.iloc[0]
     features = row.drop(labels=['animal_name', 'class_type']).to_dict()
-    # ensure ints
-    features = {k: int(v) for k, v in features.items()}
-    return features
-
-
-# Flask app
-app = Flask(__name__)
-label_map = build_label_mapping()
-
-
-@app.route('/')
-def index():
-    return jsonify({"status": "ok", "model_exists": os.path.exists(MODEL_PATH)})
-
-
-@app.route('/train', methods=['POST'])
-def train_endpoint():
-    result = train_and_save()
-    # reload label_map in case class.csv changed
-    global label_map
-    label_map = build_label_mapping()
-    return jsonify(result)
-
-
-@app.route('/predict', methods=['POST'])
-def predict_endpoint():
-    payload = request.get_json(force=True)
-    model = load_model()
-    if model is None:
-        return jsonify({"error": "model not found, train first via /train"}), 400
-
-    # Two modes: provide 'animal_name' or provide feature dict
-    if 'animal_name' in payload:
-        features = find_features_for_animal(payload['animal_name'])
-        if not features:
-            return jsonify({"error": f"animal '{payload['animal_name']}' not found in zoo.csv"}), 404
-    elif 'features' in payload:
-        features = payload['features']
-    else:
-        return jsonify({"error": "provide 'animal_name' or 'features' in JSON body"}), 400
-
-    pred_class = predict_from_features(features, model)
-    human_label = label_map.get(pred_class, str(pred_class))
-    return jsonify({"predicted_class": int(pred_class), "label": human_label})
-
-
+    return {k: int(v) for k, v in features.items()}
 def main():
-    parser = argparse.ArgumentParser(description='Animal classification API')
-    parser.add_argument('--train', action='store_true', help='Train model and save to disk')
-    parser.add_argument('--host', default='127.0.0.1')
-    parser.add_argument('--port', default=5000, type=int)
-    args = parser.parse_args()
+    import streamlit as st
 
-    if args.train:
-        print('Training model...')
-        res = train_and_save()
-        print('Done. Accuracy:', res['accuracy'])
+    st.set_page_config(page_title='Animal Class Prediction — Manual Input', layout='centered')
+    st.title('Animal class prediction — Manual feature entry')
 
-    # start Flask app
-    app.run(host=args.host, port=args.port)
+    st.markdown('Enter features manually (no dataset selection). The app will load `zoo_rf_model.joblib` from the project root or you can upload a model file.')
+
+    # show helpful message if sklearn missing
+    if not SKLEARN_AVAILABLE:
+        st.error('scikit-learn is not installed in this environment.')
+        st.info(f'Install with: {SKLEARN_INSTALL_CMD}')
+        st.stop()
+
+    # label mapping (optional; used to display human readable label)
+    label_map = build_label_mapping()
+
+    # try to load model from disk
+    model = None
+    try:
+        model = load_model()
+    except Exception as e:
+        st.warning(f'Failed to load existing model: {e}')
+
+    if model is None:
+        st.info('No model found at `zoo_rf_model.joblib`. You can upload a .joblib model file below.')
+        uploaded = st.file_uploader('Upload model (.joblib)', type=['joblib', 'pkl'])
+        if uploaded is not None:
+            # save uploaded file to MODEL_PATH and load it
+            with open(MODEL_PATH, 'wb') as f:
+                f.write(uploaded.getbuffer())
+            try:
+                model = load_model()
+                st.success('Model uploaded and loaded successfully.')
+            except Exception as e:
+                st.error(f'Failed to load uploaded model: {e}')
+
+    # Allow retraining directly from included zoo.csv to get a working model
+    if st.button('Retrain model from included zoo.csv'):
+        try:
+            df_all = load_data()
+            with st.spinner('Training model on zoo.csv...'):
+                new_model, acc = train_model(df_all)
+            model = new_model
+            st.success(f'Retrained model (accuracy on test set: {acc:.3f}). Model saved to zoo_rf_model.joblib')
+        except Exception as e:
+            st.error(f'Retraining failed: {e}')
+
+    st.markdown('---')
+    st.subheader('Enter features')
+
+    # Prepare default values by attempting to read first row of zoo.csv; fallback to zeros
+    try:
+        df_defaults = load_data()
+        sample = df_defaults.drop(columns=['animal_name', 'class_type']).iloc[0]
+    except Exception:
+        sample = None
+
+    cols = ['hair', 'feathers', 'eggs', 'milk', 'airborne', 'aquatic', 'predator', 'toothed', 'backbone', 'breathes', 'venomous', 'fins', 'legs', 'tail', 'domestic', 'catsize']
+
+    features = {}
+    with st.form('manual_features'):
+        for c in cols:
+            if c == 'legs':
+                default = int(sample[c]) if sample is not None and c in sample.index else 4
+                val = st.number_input('legs', min_value=0, max_value=8, value=default)
+            else:
+                default = int(sample[c]) if sample is not None and c in sample.index else 0
+                val = st.selectbox(c, options=[0, 1], index=default)
+            features[c] = int(val)
+
+        submitted = st.form_submit_button('Predict')
+        if submitted:
+            # Use real model prediction when available
+            if not SKLEARN_AVAILABLE:
+                st.error('scikit-learn is not installed in this environment.')
+            elif model is None:
+                st.error('No model available. Upload a .joblib model or place `zoo_rf_model.joblib` in the project root.')
+            else:
+                try:
+                    pred = predict_from_features(model, features)
+                    label = label_map.get(pred, str(pred))
+                    st.success('Prediction complete')
+                    st.write(label)
+                except Exception as e:
+                    st.error(f'Prediction failed: {e}')
+
+    # mapping display removed by user request
 
 
 if __name__ == '__main__':
