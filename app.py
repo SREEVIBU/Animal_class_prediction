@@ -123,17 +123,6 @@ def main():
             except Exception as e:
                 st.error(f'Failed to load uploaded model: {e}')
 
-    # Allow retraining directly from included zoo.csv to get a working model
-    if st.button('Retrain model from included zoo.csv'):
-        try:
-            df_all = load_data()
-            with st.spinner('Training model on zoo.csv...'):
-                new_model, acc = train_model(df_all)
-            model = new_model
-            st.success(f'Retrained model (accuracy on test set: {acc:.3f}). Model saved to zoo_rf_model.joblib')
-        except Exception as e:
-            st.error(f'Retraining failed: {e}')
-
     st.markdown('---')
     st.subheader('Enter features')
 
